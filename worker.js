@@ -65,6 +65,7 @@ async function ensureSchema(env) {
     env.DB.prepare("CREATE TABLE IF NOT EXISTS files (id TEXT PRIMARY KEY, name TEXT, type TEXT, size INTEGER, created INTEGER, by TEXT)"),
     env.DB.prepare("CREATE TABLE IF NOT EXISTS file_chunks (id TEXT NOT NULL, seq INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(id, seq))"),
     env.DB.prepare("CREATE TABLE IF NOT EXISTS leases (path TEXT PRIMARY KEY, holder TEXT, exp INTEGER)"),
+    env.DB.prepare("CREATE TABLE IF NOT EXISTS login_fails (k TEXT PRIMARY KEY, n INTEGER NOT NULL, exp INTEGER NOT NULL)"),
   ]);
   schemaReady = true;
 }
@@ -104,6 +105,23 @@ async function createUser(env, {username, name, password, role}) {
   return id;
 }
 
+/* ---------------- login throttle ---------------- */
+// กันสุ่มเดารหัสผ่าน: ใส่ผิดได้ 10 ครั้ง / 15 นาที ต่อ IP และ 30 ครั้ง / 15 นาที ต่อชื่อผู้ใช้
+// (ต่อชื่อผู้ใช้ตั้งสูงกว่า เพื่อไม่ให้ใครแกล้งพิมพ์ผิดจนเจ้าของบัญชีเข้าระบบไม่ได้ง่าย ๆ)
+const LOGIN_MAX_IP = 10, LOGIN_MAX_USER = 30, LOGIN_WINDOW_MS = 15*60*1000;
+function loginKeys(req, uname) {
+  const slot = Math.floor(Date.now() / LOGIN_WINDOW_MS);
+  return ['ip:' + (req.headers.get('cf-connecting-ip') || 'unknown') + ':' + slot, 'user:' + uname + ':' + slot];
+}
+async function loginBlocked(env, keys) {
+  const r = await env.DB.prepare('SELECT (SELECT n FROM login_fails WHERE k=?) ip, (SELECT n FROM login_fails WHERE k=?) usr').bind(...keys).first();
+  return (r?.ip || 0) >= LOGIN_MAX_IP || (r?.usr || 0) >= LOGIN_MAX_USER;
+}
+async function loginFailed(env, keys) {
+  const exp = Date.now() + LOGIN_WINDOW_MS;
+  await env.DB.batch(keys.map(k => env.DB.prepare('INSERT INTO login_fails(k,n,exp) VALUES(?,1,?) ON CONFLICT(k) DO UPDATE SET n=n+1').bind(k, exp)));
+}
+
 /* ---------------- routing ---------------- */
 async function route(req, env, ctx) {
   const url = new URL(req.url); const p = url.pathname; const M = req.method;
@@ -140,9 +158,16 @@ async function route(req, env, ctx) {
   }
   if (p === '/api/login' && M === 'POST') {
     const b = await req.json();
-    const u = await env.DB.prepare('SELECT * FROM users WHERE username=?').bind(String(b.username||'').trim().toLowerCase()).first();
+    const uname = String(b.username||'').trim().toLowerCase();
+    const keys = loginKeys(req, uname);
+    if (await loginBlocked(env, keys)) fail(429,'too_many','ใส่รหัสผ่านผิดหลายครั้งเกินไป กรุณารอ 15 นาทีแล้วลองใหม่');
+    const u = await env.DB.prepare('SELECT * FROM users WHERE username=?').bind(uname).first();
     const ok = u && u.active && safeEq(await hashPass(String(b.password||''), u.salt), u.pass);
-    if (!ok) { await new Promise(r=>setTimeout(r,600)); fail(401,'bad_login','ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง'); }
+    if (!ok) { await loginFailed(env, keys); await new Promise(r=>setTimeout(r,600)); fail(401,'bad_login','ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง'); }
+    ctx.waitUntil(env.DB.batch([
+      env.DB.prepare('DELETE FROM login_fails WHERE exp<?').bind(Date.now()),
+      env.DB.prepare('DELETE FROM sessions WHERE exp<?').bind(Date.now()),
+    ]).catch(() => {}));
     return json({ok:true}, 200, {'set-cookie': await startSession(env, u.id)});
   }
   if (p === '/logout') {
